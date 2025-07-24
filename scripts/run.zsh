@@ -1,6 +1,6 @@
 #!/bin/zsh
 node="lighthouse-geth-1"
-network="devnet-2"
+network="devnet-3"
 domain="ethpandaops.io"
 prefix="fusaka"
 sops_name=$(sops --decrypt ../ansible/inventories/$network/group_vars/all/all.sops.yaml | yq -r '.secret_nginx_shared_basic_auth.name')
@@ -43,6 +43,7 @@ print_usage() {
   echo "  fork_choice                       Get the fork choice of the network"
   echo "  send_blob n                       Send "n" number of blob(s) to the network [default 1]"
   echo "  deposit s e [type]                Deposit to the network from validator index start to end - optional withdrawal type (0x00, 0x01, 0x02)"
+  echo "  topup validator_index[,index2,...] eth_amount  Top-up one or more validators with additional ETH (Pectra upgrade feature)"
   echo "  exit s e                          Exit from the network from validator index start to end - mandatory argument"
   echo "  set_withdrawal_addr s e address   Set the withdrawal credentials for validator index start (mandatory) to end (optional) and Ethereum address"
   echo "  full_withdrawal s e               Withdraw from the network from validator index start to end - mandatory argument"
@@ -480,6 +481,166 @@ for arg in "${command[@]}"; do
           echo "Exiting without depositing to the network"
           exit;
         fi
+      fi
+      ;;
+    "topup")
+      # Top-up one or more validators with additional ETH (Pectra upgrade feature)
+      if [[ $# -ne 3 ]]; then
+        echo "Top-up calls for exactly 2 arguments!"
+        echo "  Usage: ${0} topup validator_index[,index2,...] eth_amount"
+        echo "  Example: ${0} topup 5 35"
+        echo "  Example: ${0} topup 1,2,3 10"
+        exit;
+      else
+        validator_indices=${command[2]}
+        eth_amount=${command[3]}
+
+        # Validate ETH amount
+        if ! [[ "$eth_amount" =~ ^[0-9]+(\.[0-9]+)?$ ]] || (( $(echo "$eth_amount < 1" | bc -l) )); then
+          echo "Error: ETH amount must be >= 1."
+          exit 1
+        fi
+
+        # Parse validator indices (handle both single index and comma-separated list)
+        VALIDATOR_ARRAY=(${(s:,:)validator_indices})
+        
+        # Validate all validator indices and get their info
+        declare -a validator_pubkeys
+        
+        for validator_index in "${VALIDATOR_ARRAY[@]}"; do
+          # Validate that each index is a number
+          if ! [[ "$validator_index" =~ ^[0-9]+$ ]]; then
+            echo "Error: Validator index '$validator_index' must be a positive integer."
+            exit 1
+          fi
+          
+          # Get validator info
+          validator_info=$(curl -s "$bn_endpoint/eth/v1/beacon/states/head/validators/$validator_index")
+          if [[ $(echo "$validator_info" | jq -r '.data') == "null" ]]; then
+            echo "Error: Validator $validator_index not found."
+            exit 1
+          fi
+          
+          validator_pubkey=$(echo "$validator_info" | jq -r '.data.validator.pubkey')
+          validator_pubkeys+=("$validator_pubkey")
+        done
+
+        # Get common info
+        deposit_contract_address=$(curl -s $bn_endpoint/eth/v1/config/spec | jq -r '.data.DEPOSIT_CONTRACT_ADDRESS')
+        deposit_path="m/44'/60'/0'/0/7"
+        privatekey=$(ethereal hd keys --path="$deposit_path" --seed="$sops_mnemonic" | awk '/Private key/{print $NF}')
+        publickey=$(ethereal hd keys --path="$deposit_path" --seed="$sops_mnemonic" | awk '/Ethereum address/{print $NF}')
+
+        echo ""
+        echo "Top-up Summary:"
+        echo "  Validators: ${#VALIDATOR_ARRAY} validator(s)"
+        for ((i=1; i<=${#VALIDATOR_ARRAY}; i++)); do
+          echo "    ${VALIDATOR_ARRAY[$i]}: ${validator_pubkeys[$i]}"
+        done
+        echo "  Amount per validator: $eth_amount ETH"
+        echo "  Total amount: $(echo "${#VALIDATOR_ARRAY} * $eth_amount" | bc) ETH"
+        echo "  Deposit Contract: $deposit_contract_address"
+        echo ""
+        echo "Continue? (y/n)"
+        read -r response
+
+        if [[ $response == "y" ]]; then
+          echo "Submitting top-ups using ethereal..."
+          echo ""
+          
+          # Process each validator
+          for ((i=1; i<=${#VALIDATOR_ARRAY}; i++)); do
+            validator_index="${VALIDATOR_ARRAY[$i]}"
+            validator_pubkey="${validator_pubkeys[$i]}"
+            
+            echo "Processing validator $validator_index ($i/${#VALIDATOR_ARRAY})..."
+            echo "Command: ethereal validator topup --from=\"$publickey\" --validator=\"$validator_pubkey\" --topup-amount=\"${eth_amount}eth\" --no-safety-checks"
+            
+            # Submit topup for this validator with retry logic
+            topup_success=false
+            for retry in {1..3}; do
+              echo "Attempt $retry/3..."
+              topup_output=$(ethereal validator topup \
+                --from="$publickey" \
+                --validator="$validator_pubkey" \
+                --topup-amount="${eth_amount}eth" \
+                --privatekey="$privatekey" \
+                --connection="$rpc_endpoint" \
+                --consensus-connection="$bn_endpoint" \
+                --no-safety-checks \
+                --timeout=60s 2>&1)
+              
+              if [[ $? -eq 0 ]]; then
+                topup_success=true
+                break
+              else
+                echo "Attempt $retry failed. Error: $topup_output"
+                if [[ $retry -lt 3 ]]; then
+                  echo "Retrying in 5 seconds..."
+                  sleep 5
+                fi
+              fi
+            done
+            
+            if [[ "$topup_success" == "true" ]]; then
+              # Extract transaction hash from output
+              tx_hash=$(echo "$topup_output" | grep -oE '0x[a-fA-F0-9]{64}' | head -1)
+              if [[ -n "$tx_hash" ]]; then
+                echo "Transaction hash: $tx_hash"
+                echo "Waiting for transaction confirmation..."
+                
+                # Wait for transaction to be mined
+                for attempt in {1..30}; do
+                  receipt_response=$(curl -s --header 'Content-Type: application/json' --data-raw "{\"jsonrpc\":\"2.0\",\"method\":\"eth_getTransactionReceipt\", \"params\":[\"$tx_hash\"], \"id\":0}" $rpc_endpoint)
+                  
+                  # Debug: show raw response if it's not valid JSON
+                  if ! echo "$receipt_response" | jq . >/dev/null 2>&1; then
+                    echo "Invalid JSON response: $receipt_response"
+                    echo "Retrying..."
+                    sleep 2
+                    continue
+                  fi
+                  
+                  receipt_result=$(echo "$receipt_response" | jq -r '.result // empty')
+                  if [[ -n "$receipt_result" && "$receipt_result" != "null" ]]; then
+                    tx_status=$(echo "$receipt_result" | jq -r '.status // empty')
+                    if [[ "$tx_status" == "0x1" ]]; then
+                      echo "✓ Validator $validator_index top-up successful! (confirmed)"
+                      break
+                    else
+                      echo "✗ Validator $validator_index top-up failed! (transaction reverted)"
+                      break
+                    fi
+                  fi
+                  echo "Waiting for confirmation... (attempt $attempt/30)"
+                  sleep 2
+                done
+                
+                if [[ $attempt -eq 30 ]]; then
+                  echo "⚠ Transaction confirmation timeout for validator $validator_index"
+                fi
+              else
+                echo "✓ Validator $validator_index top-up successful! (no tx hash found)"
+              fi
+            else
+              echo "✗ Validator $validator_index top-up failed!"
+              echo "Error output: $topup_output"
+            fi
+            echo ""
+            
+            # Small delay between transactions
+            if [[ $i -lt ${#VALIDATOR_ARRAY} ]]; then
+              echo "Waiting 2 seconds before next transaction..."
+              sleep 2
+            fi
+          done
+          
+          echo "Top-up process completed for ${#VALIDATOR_ARRAY} validator(s)."
+        else
+          echo "Top-up cancelled."
+        fi
+
+        exit;
       fi
       ;;
     "exit")
